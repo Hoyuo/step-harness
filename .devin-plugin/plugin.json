@@ -1,0 +1,5 @@
+{
+  "name": "step-harness",
+  "version": "0.3.0",
+  "description": "모델이 지시를 따르든 말든 결과가 같도록: 라우터 → NEXT_ACTION 1개 → 정확 일치 게이트 → hook 이 쓰는 receipt → 코드가 돌리는 판정."
+}

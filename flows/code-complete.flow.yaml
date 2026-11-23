@@ -1,0 +1,28 @@
+# code complete: 게이트 → (실패 종류별) 수정 → 게이트 재실행.
+# 무엇을 다음에 할지는 전부 이 파일과 게이트의 exit code 가 정한다. 모델은 한 번에 액션 하나만 받는다.
+flow: code_complete
+args: [gate]              # 게이트 명령. 실패하면 stdout 에 `HARNESS_ROUTE=<실패 종류>` 한 줄을 찍는다
+start: gate
+max_visits: 3             # 고치는 액션의 재시도 한도. 넘으면 사람에게 넘긴다
+
+actions:
+  gate:                   # judge — 도구 없음. 하네스가 명령을 돌려 exit code 로 판정
+    check: "{gate}"
+    on:
+      pass: done
+      fail: { unit-test: fix_tests, "*": fix_direct }   # 실패 분기 = 게이트 출력 (모델의 판단 아님)
+
+  fix_tests:              # call — 이 도구를 이 params 로 정확히 1번. 그동안 메인은 직접 수정 불가
+    tool: skill
+    params: { skill: eats-write-unit-test, args: "{last_report}" }
+    deny: [edit, write, apply_patch, notebook_edit, exec]
+    write_scope: ["lib/**", "test/**"]                  # 위임된 작업자도 이 밖은 못 쓴다
+    on: { pass: gate }    # 끝나면 게이트 재실행 (성공 여부는 게이트만 안다)
+
+  fix_direct:             # work — 메인이 직접 수정해도 되는 경우 (범위 제한)
+    work: Fix every failure listed in {last_report}. Change only what the report requires.
+    allow: [edit, write, apply_patch]
+    write_scope: ["lib/**", "test/**"]
+    on: { pass: gate }
+
+done: code complete gate passed

@@ -1,0 +1,26 @@
+{
+  "flow": "code_complete",
+  "args": ["gate"],
+  "start": "gate",
+  "max_visits": 3,
+  "actions": {
+    "gate": {
+      "check": "{gate}",
+      "on": { "pass": "done", "fail": { "unit-test": "fix_tests", "*": "fix_direct" } }
+    },
+    "fix_tests": {
+      "tool": "skill",
+      "params": { "skill": "eats-write-unit-test", "args": "{last_report}" },
+      "deny": ["edit", "write", "apply_patch", "notebook_edit", "exec"],
+      "write_scope": ["lib/**", "test/**"],
+      "on": { "pass": "gate" }
+    },
+    "fix_direct": {
+      "work": "Fix every failure listed in {last_report}. Change only what the report requires.",
+      "allow": ["edit", "write", "apply_patch"],
+      "write_scope": ["lib/**", "test/**"],
+      "on": { "pass": "gate" }
+    }
+  },
+  "done": "code complete gate passed"
+}

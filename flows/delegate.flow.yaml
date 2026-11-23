@@ -1,0 +1,15 @@
+# 가장 단순한 형태: "수정은 반드시 fixer 서브에이전트로" 하나만 강제한다.
+flow: delegate
+args: [target, verify]
+start: fix
+actions:
+  fix:
+    tool: run_subagent
+    params:
+      profile: fixer                  # 플러그인의 프로필이면 step-harness:fixer
+      task: "Fix {target}. Read the code first and change only what is needed."
+    rewrite: [task]                   # task 는 모델이 뭐라고 넘기든 위 문장으로 덮어쓴다 (updatedInput)
+    deny: [edit, write, apply_patch, exec]
+    check: "{verify}"                 # 통과 조건. 실패하면 같은 액션 재시도, 3회 넘으면 사람에게
+    on: { pass: done }
+done: "{target} fixed and verified"

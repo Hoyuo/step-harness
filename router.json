@@ -1,0 +1,5 @@
+{
+  "routes": [
+    { "name": "smoke test", "when": "^/?harness smoke$", "flow": "flows/smoke.flow.yaml", "args": {} }
+  ]
+}

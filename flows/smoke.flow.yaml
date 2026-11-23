@@ -1,0 +1,14 @@
+# 설치 확인용. Devin 세션에서 "harness smoke" 라고 입력하면 실행된다 (플러그인의 router.json 에 등록돼 있다).
+# 확인되는 것: 라우터 주입 → 판정 → 범위가 제한된 직접 작업 → 재판정 → 종료 허용
+flow: smoke
+start: gate
+actions:
+  gate:
+    check: test -f step-harness-smoke.txt
+    on: { pass: done, fail: make }
+  make:
+    work: Create the file step-harness-smoke.txt in the project root containing the single word ok.
+    allow: [write, edit]
+    write_scope: [step-harness-smoke.txt]
+    on: { pass: gate }
+done: step-harness works in this environment (step-harness-smoke.txt can be deleted)

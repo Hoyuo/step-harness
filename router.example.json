@@ -1,0 +1,16 @@
+{
+  "routes": [
+    {
+      "name": "code complete",
+      "when": "코드\\s*컴플리트\\s*(돌려|실행|해줘)|^/?cc\\b",
+      "flow": "flows/code-complete.flow.yaml",
+      "args": { "gate": "node scripts/validate-gate.mjs" }
+    },
+    {
+      "name": "delegate fix",
+      "when": "^fix:\\s*(\\S+)",
+      "flow": "flows/delegate.flow.yaml",
+      "args": { "target": "$1", "verify": "flutter analyze lib" }
+    }
+  ]
+}
