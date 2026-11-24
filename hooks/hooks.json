@@ -1,0 +1,62 @@
+{
+  "description": "step-harness: plan first, then one enforced step at a time (Claude Code layout; Devin reads the hooks.json at the plugin root)",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "STEP_HARNESS_HOOK=claude-layout node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.cjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "STEP_HARNESS_HOOK=claude-layout node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.cjs\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "STEP_HARNESS_HOOK=claude-layout node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.cjs\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "STEP_HARNESS_HOOK=claude-layout node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.cjs\"",
+            "timeout": 55
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "STEP_HARNESS_HOOK=claude-layout node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook.cjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

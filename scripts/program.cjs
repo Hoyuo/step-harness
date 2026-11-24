@@ -23,7 +23,7 @@ const MAX_ITERATIONS = 1000;   // 겹친 h.retries 반복 횟수의 곱 상한 (
 const MAX_OPS = 100000;        // 실행 중 문장·반복 횟수 상한 (동적. 일을 하지 않는 반복이 프로세스를 붙잡지 못하게)
 const MAX_SOURCE = 20000;      // 프로그램 길이 상한 (문자)
 const BAD_PROPS = new Set(['__proto__', 'constructor', 'prototype']);
-const WORK_CALLS = new Set(['check', 'skill', 'agent']);
+const WORK_CALLS = new Set(['check', 'work', 'skill', 'agent']);
 
 // ───────── 토크나이저
 function tokenize(src) {
@@ -274,6 +274,7 @@ function parse(src) {
 //   writable 목록이 있으면: 그 목록에 있는 것만 (관리자가 정한 범위)
 //   없으면: 첫 경로 조각이 와일드카드 없는 이름이어야 하고("src/**"), 숨김 경로(.git · .devin · .github …)는 안 된다
 function scopeError(g, writable) {
+  if (typeof g === 'string' && g.split('/').some((seg) => seg.startsWith('-'))) return 'a path segment may not start with "-" (it would look like a command option)';
   if (typeof g !== 'string' || !g.trim()) return 'empty';
   if (/[<>]/.test(g)) return 'replace the placeholder with a real path';
   if (path.isAbsolute(g) || g.includes('\\') || g.split('/').includes('..')) return 'only relative paths inside the project';
@@ -286,7 +287,7 @@ function scopeError(g, writable) {
 }
 
 // ───────── 정적 검증
-// reg: { gates: {name: cmd|{cmd,about}}, skills?: {name: about}, agents?: {name: about}, writable?: [glob], worker?: string }
+// reg: { gates: {name: cmd|{cmd,about}}, skills?: {name: about}, agents?: {name: about}, writable?: [glob] }
 function verify(ast, reg = {}) {
   const E = [];
   const at = (n) => (n && n.at ? `${n.at.line}:${n.at.col} ` : '');
@@ -312,7 +313,7 @@ function verify(ast, reg = {}) {
     const m = hcall(n);
     if (!m) return E.push(`${at(n)}only h.<method>(…) can be called`);
     const a = n.args;
-    const known = ['check', 'skill', 'agent', 'done', 'handoff', 'retries'];
+    const known = ['check', 'work', 'skill', 'agent', 'done', 'handoff', 'retries'];
     if (!known.includes(m)) return E.push(`${at(n)}h.${m} does not exist (h.${known.join(', h.')})`);
     if ((m === 'done' || m === 'handoff') && ctx !== 'return') E.push(`${at(n)}h.${m}() must be used as "return h.${m}(…)"`);
     if (m === 'retries' && ctx !== 'for') E.push(`${at(n)}h.retries() is only allowed as "for (const x of h.retries(N))"`);
@@ -323,12 +324,17 @@ function verify(ast, reg = {}) {
       else if (!Object.prototype.hasOwnProperty.call(gates, a[0].v)) E.push(`${at(n)}unknown gate "${a[0].v}" (known: ${Object.keys(gates).join(', ') || 'none — register gates in config.json'})`);
       else if (!gateCmd(gates[a[0].v])) E.push(`${at(n)}gate "${a[0].v}" has no command in config.json`);
     }
-    if (m === 'skill' || m === 'agent') {
-      const sect = m === 'skill' ? reg.skills : reg.agents;
-      if (a.length !== 3 || !strLit(a[0])) E.push(`${at(n)}h.${m}(name: string literal, ${m === 'skill' ? 'args' : 'task'}: string, { scope: [...] })`);
-      else if (sect && !Object.prototype.hasOwnProperty.call(sect, a[0].v)) E.push(`${at(n)}unknown ${m} "${a[0].v}" (known: ${Object.keys(sect).join(', ')})`);
+    if (m === 'work') {
+      if (a.length !== 2) E.push(`${at(n)}h.work(task: string, { scope: [...] })`);
       checkScope(n, a[a.length - 1]);
-      if (!reg.worker) E.push(`${at(n)}h.${m} needs a worker command (config.json "worker")`);
+    }
+    if (m === 'skill' || m === 'agent') {
+      const sect = (m === 'skill' ? reg.skills : reg.agents) || {};
+      const names = Object.keys(sect);
+      if (!names.length) E.push(`${at(n)}h.${m} is not available: no ${m}s are registered in config.json "${m}s" — use h.work`);
+      else if (a.length !== 3 || !strLit(a[0])) E.push(`${at(n)}h.${m}(name: string literal, ${m === 'skill' ? 'args' : 'task'}: string, { scope: [...] })`);
+      else if (!Object.prototype.hasOwnProperty.call(sect, a[0].v)) E.push(`${at(n)}unknown ${m} "${a[0].v}" (known: ${names.join(', ')})`);
+      checkScope(n, a[a.length - 1]);
     }
     if (m === 'retries' && (a.length !== 1 || a[0].type !== 'Lit' || !Number.isInteger(a[0].v) || a[0].v < 1 || a[0].v > MAX_RETRIES)) {
       E.push(`${at(n)}h.retries(N): N must be an integer literal 1..${MAX_RETRIES}`);
@@ -415,7 +421,7 @@ function verify(ast, reg = {}) {
         return true;   // 같은 블록의 다음 문장은 도달 불가
       case 'Expr': {
         const c = unwrap(s.expr);
-        if (!hcall(c) || !WORK_CALLS.has(hcall(c))) E.push(`${at(s)}a statement must be a call to h.check / h.skill / h.agent`);
+        if (!hcall(c) || !WORK_CALLS.has(hcall(c))) E.push(`${at(s)}a statement must be a call to h.check / h.work / h.skill / h.agent`);
         walkExpr(s.expr, scopeOf(), 'stmt');
         return false;
       }
@@ -424,21 +430,23 @@ function verify(ast, reg = {}) {
   }
   const ends = walkBlock(ast.body, false);
   if (!ends) E.push('every path must end with "return h.done(…)" or "return h.handoff(…)" (the end of the function is reachable)');
-  if (!workCalls) E.push('the program never calls h.check / h.skill / h.agent');
+  if (!workCalls) E.push('the program never calls h.check / h.work / h.skill / h.agent');
   return E;
 }
 
-// ───────── 타입 선언: 모델에게 보여주는 "SDK" (등록된 이름이 리터럴 유니언 타입으로 들어간다)
+// ───────── 타입 선언: 모델에게 보여주는 "SDK" (등록된 이름이 리터럴 유니언 타입으로 들어간다. 등록되지 않은 종류의 메서드는 보여주지 않는다)
 function declaration(reg = {}, doneWhen = []) {
-  const u = (o, fallback) => { const k = Object.keys(o || {}); return k.length ? k.map((x) => JSON.stringify(x)).join(' | ') : fallback; };
+  const names = (o) => Object.keys(o || {});
+  const u = (o) => names(o).map((x) => JSON.stringify(x)).join(' | ');
   const scope = Array.isArray(reg.writable) && reg.writable.length ? `(${reg.writable.map((x) => JSON.stringify(x)).join(' | ')})[]` : 'string[]';
   return [
-    'type Verdict = { pass: boolean; route: string | null; report: string; exit: number };   // report = 게이트 출력 파일 경로',
-    'type Result  = { ok: boolean; exit: number };',
+    'type Verdict = { pass: boolean; route: string | null; report: string; exit: number };   // report = path of the check\'s output file',
+    'type Result  = { ok: boolean };',
     'declare const h: {',
-    `  check(gate: ${u(reg.gates, 'never')}): Promise<Verdict>;`,
-    `  skill(name: ${u(reg.skills, 'string')}, args: string, opts: { scope: ${scope} }): Promise<Result>;`,
-    `  agent(profile: ${u(reg.agents, 'string')}, task: string, opts: { scope: ${scope} }): Promise<Result>;`,
+    ...(names(reg.gates).length ? [`  check(gate: ${u(reg.gates)}): Promise<Verdict>;   // the harness runs this registered check itself`] : []),
+    `  work(task: string, opts: { scope: ${scope} }): Promise<Result>;   // YOU do this task when its step comes; you can write only inside scope`,
+    ...(names(reg.skills).length ? [`  skill(name: ${u(reg.skills)}, args: string, opts: { scope: ${scope} }): Promise<Result>;   // when its step comes you invoke this skill, exactly once`] : []),
+    ...(names(reg.agents).length ? [`  agent(profile: ${u(reg.agents)}, task: string, opts: { scope: ${scope} }): Promise<Result>;   // when its step comes you start this subagent with this task, exactly once`] : []),
     `  retries(n: 1..${MAX_RETRIES}): Iterable<number>;   // only in: for (const i of h.retries(n))`,
     '  done(message?: string): never;      // only in: return h.done(…)' + (doneWhen.length ? ` — accepted only if ${doneWhen.map((g) => JSON.stringify(g)).join(' and ')} pass${doneWhen.length > 1 ? '' : 'es'} (the harness runs ${doneWhen.length > 1 ? 'them' : 'it'} itself)` : ''),
     '  handoff(reason?: string): never;    // only in: return h.handoff(…) — asks the human',
@@ -446,22 +454,20 @@ function declaration(reg = {}, doneWhen = []) {
   ].join('\n');
 }
 
-// 프롬프트에 넣는 예시 한 개 (등록된 이름으로 만든다 → 그대로 베껴도 검증을 통과하는 모양)
+// 프롬프트에 넣는 예시 한 개 (등록된 이름으로 만든다. 범위 자리표시만 채우면 검증을 통과하는 모양)
 function example(reg = {}, doneWhen = []) {
   const q = (x) => JSON.stringify(x);
   const gate = doneWhen[0] || Object.keys(reg.gates || {})[0];
-  const agent = Object.keys(reg.agents || {})[0] || 'worker';
   const scope = Array.isArray(reg.writable) && reg.writable.length ? `[${reg.writable.slice(0, 2).map(q).join(', ')}]` : '["<dir>/**"]';
-  if (gate && reg.worker) {
-    return ['async (h) => {', '  for (const attempt of h.retries(3)) {', `    const r = await h.check(${q(gate)});`, '    if (r.pass) return h.done("<what is now true>");',
-      `    await h.agent(${q(agent)}, \`Fix every failure listed in \${r.report}\`, { scope: ${scope} });`, '  }', '  return h.handoff("still failing after 3 attempts");', '}'].join('\n');
+  if (gate) {
+    return ['async (h) => {', `  await h.work("<what to change, in full sentences>", { scope: ${scope} });`, '  for (const attempt of h.retries(3)) {', `    const r = await h.check(${q(gate)});`,
+      '    if (r.pass) return h.done("<what is now true>");', `    await h.work(\`Fix every failure listed in \${r.report}\`, { scope: ${scope} });`, '  }',
+      '  return h.handoff("still failing after 3 attempts");', '}'].join('\n');
   }
-  if (gate) return ['async (h) => {', `  const r = await h.check(${q(gate)});`, '  if (r.pass) return h.done("<what is now true>");', '  return h.handoff(`failing: see ${r.report}`);', '}'].join('\n');
-  return ['async (h) => {', `  const r = await h.agent(${q(agent)}, "<the task, in full sentences>", { scope: ${scope} });`, '  if (r.ok) return h.done("<what was done>");',
-    '  return h.handoff("the worker failed");', '}'].join('\n');
+  return ['async (h) => {', `  await h.work("<what to change, in full sentences>", { scope: ${scope} });`, '  return h.done("<what was done>");', '}'].join('\n');
 }
 
-// ───────── 실행 (검증된 AST 만). host: { check(name), skill(name,args,scope), agent(name,task,scope), maxSteps }
+// ───────── 실행 (검증된 AST 만). host: { check(name), work(task,scope), skill(name,args,scope), agent(name,task,scope), maxSteps }
 const BREAK = Symbol('break'), CONTINUE = Symbol('continue');
 function run(ast, host) {
   const h = ast.param;
@@ -501,6 +507,7 @@ function run(ast, host) {
         if (++steps > host.maxSteps) throw new Error(`step budget exceeded (${host.maxSteps})`);
         let r;
         if (m === 'check') r = host.check(a[0]);
+        else if (m === 'work') r = host.work(str(a[0]), a[1].scope);
         else if (m === 'skill') r = host.skill(a[0], str(a[1]), a[2].scope);
         else r = host.agent(a[0], str(a[1]), a[2].scope);
         trace.push({ call: `${m}:${a[0]}`, ...r });
@@ -541,6 +548,27 @@ function run(ast, host) {
   return { status: r.$end === 'done' ? 'done' : 'handoff', message: r.message, trace };
 }
 
+// ───────── 한 걸음씩: 기록(trace)을 되짚어 "다음에 할 한 걸음"을 구한다.
+// 프로그램은 같은 결과를 받으면 같은 길로 간다 → 처음부터 다시 돌리면서 기록된 결과를 차례로 돌려주고, 기록이 끝난 자리의 호출이 다음 걸음이다.
+//   trace: [{ key, result }] (key = 그 호출의 종류와 인자)
+//   반환: { step: { op, args, key, n } } | { end: 'done' | 'handoff', message }
+const PENDING = Symbol('pending');
+function next(ast, trace, maxSteps) {
+  let i = 0;
+  const take = (op, args) => {
+    const key = JSON.stringify([op, ...args]);
+    if (i < trace.length) {
+      const t = trace[i++];
+      if (t.key !== key) throw new Error(`the recorded steps do not match the program (step ${i}: recorded ${t.key}, the program asks for ${key})`);
+      return t.result;
+    }
+    throw Object.assign(new Error('pending'), { [PENDING]: { op, args, key, n: i + 1 } });
+  };
+  const host = { maxSteps, check: (g) => take('check', [g]), work: (task, scope) => take('work', [task, scope]),
+    skill: (name, args, scope) => take('skill', [name, args, scope]), agent: (name, task, scope) => take('agent', [name, task, scope]) };
+  try { const r = run(ast, host); return { end: r.status, message: r.message }; } catch (e) { if (e && e[PENDING]) return { step: e[PENDING] }; throw e; }
+}
+
 // 파싱 + 검증을 한 번에. { ast, errors }
 function compile(code, reg) {
   // 모델이 습관적으로 붙이는 ```ts … ``` 울타리는 떼고 본다 (줄 번호가 밀리지 않게 빈 줄로 둔다)
@@ -553,4 +581,4 @@ function compile(code, reg) {
   try { return { ast, errors: verify(ast, reg) }; } catch (e) { return deep(e); }
 }
 
-module.exports = { tokenize, parse, verify, declaration, example, run, compile, scopeError, MAX_RETRIES, MAX_ITERATIONS, MAX_OPS };
+module.exports = { tokenize, parse, verify, declaration, example, run, next, compile, scopeError, MAX_RETRIES, MAX_ITERATIONS, MAX_OPS };

@@ -1,5 +1,5 @@
 {
   "name": "step-harness",
-  "version": "0.4.0",
-  "description": "모델이 지시를 따르든 말든 결과가 같도록: 라우터 → NEXT_ACTION 1개 → 정확 일치 게이트 → hook 이 쓰는 receipt → 코드가 돌리는 판정."
+  "version": "0.5.0",
+  "description": "계획 먼저: 에이전트가 할 일을 프로그램(계획 파일)으로 내면, 하네스가 검증하고 한 걸음씩 강제한다. 순서와 완료 판정은 코드가 한다."
 }
