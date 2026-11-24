@@ -77,28 +77,42 @@ function sleep(ms) { if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuff
 function alive(pid) { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }
 function withLock(root, fn) {
   const f = sp(root, 'lock');
+  const me = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;   // 내 락임을 확인할 표식 (맨 앞은 pid)
   let held = false;
   try { fs.mkdirSync(path.dirname(f), { recursive: true }); } catch { /* 아래에서 락 없이 진행 */ }
   const deadline = Date.now() + 3000;
   while (Date.now() < deadline) {
-    try { fs.writeFileSync(f, String(process.pid), { flag: 'wx' }); held = true; break; } catch (e) {
+    try { fs.writeFileSync(f, me, { flag: 'wx' }); held = true; break; } catch (e) {
       if (e.code !== 'EEXIST') break;
       try {
-        const old = Date.now() - fs.statSync(f).mtimeMs > 10000;
-        if (old || !alive(+fs.readFileSync(f, 'utf8'))) { fs.unlinkSync(f); continue; }
+        const seen = fs.readFileSync(f, 'utf8');
+        if (Date.now() - fs.statSync(f).mtimeMs > 10000 || !alive(parseInt(seen, 10))) {
+          // 죽은 락을 치운다. 여러 프로세스가 동시에 치우려 할 수 있다 → 이름을 바꿔 가져온 뒤, 방금 본 바로 그 락일 때만 버린다
+          const grave = `${f}.${process.pid}.stale`;
+          fs.renameSync(f, grave);
+          if (fs.readFileSync(grave, 'utf8') !== seen) { try { fs.linkSync(grave, f); } catch { /* 그 사이 새 락이 생겼다 */ } }   // 남의 새 락을 집었다 → 되돌린다
+          try { fs.unlinkSync(grave); } catch { /* 무시 */ }
+          continue;
+        }
       } catch { continue; }
       sleep(12);
     }
   }
-  try { return fn(); } finally { if (held) { try { fs.unlinkSync(f); } catch { /* 무시 */ } } }
+  try { return fn(); } finally {
+    if (held) { try { if (fs.readFileSync(f, 'utf8') === me) fs.unlinkSync(f); } catch { /* 무시 */ } }   // 내 락일 때만 푼다 (너무 오래 걸려 빼앗겼다면 남의 락이다)
+  }
 }
 
 // ───────── 경로·범위
-function canon(p) {   // 심볼릭 링크를 풀어 비교 (없는 경로는 존재하는 부모까지만)
+// 심볼릭 링크를 풀고, 디스크에 저장된 실제 대소문자로 맞춰 비교한다 (없는 경로는 존재하는 부모까지만).
+// macOS·Windows 는 대소문자를 구분하지 않는다: ".STEP-HARNESS/state.json" 은 ".step-harness/state.json" 과 같은 파일이다.
+// (JS 구현인 fs.realpathSync 는 입력한 대소문자를 그대로 돌려준다 → native 를 쓴다)
+const realpath = fs.realpathSync.native || fs.realpathSync;
+function canon(p) {
   let cur = path.resolve(p);
   const rest = [];
   for (;;) {
-    try { return path.join(fs.realpathSync(cur), ...rest); } catch { /* 부모로 */ }
+    try { return path.join(realpath(cur), ...rest); } catch { /* 부모로 */ }
     const up = path.dirname(cur);
     if (up === cur) return path.resolve(p);
     rest.unshift(path.basename(cur));
@@ -153,31 +167,54 @@ function touchesHarness(root, tool, input, active) {
   if (FILE_MUTATORS.has(tool)) {
     const t = targetPaths(tool, input);
     if (t) return t.some((p) => dirs.some((d) => inside(root, d, p)));
-    return strings(input).some((s) => s.length < 4096 && s.includes(DIR));
+    return strings(input).some((s) => s.length < 4096 && s.toLowerCase().includes(DIR));
   }
-  if (tool === 'exec' || tool === 'write_to_process') {
+  if (tool === 'exec' || tool === 'write_to_process') {   // 문자열 검사는 대소문자를 가리지 않는다 (위와 같은 이유)
     const s = strings(input).join('\n');
-    return (s.includes(DIR) || (active && s.includes(PLUGIN_DIR))) && !READ_ONLY_CMD.test(s);
+    const low = s.toLowerCase();
+    return (low.includes(DIR) || (active && low.includes(PLUGIN_DIR.toLowerCase()))) && !READ_ONLY_CMD.test(s);
   }
   return false;
 }
-// 모델이 부를 수 있는 하네스 CLI 인가: `node <이 플러그인의 harness.cjs> next|check|status` 단독 실행만
+// 모델이 부를 수 있는 하네스 CLI 인가. 허용 형태 (그 외 셸 문법은 전부 거부):
+//   node <이 플러그인의 harness.cjs> next|check|status [--wait N]
+//   node <…harness.cjs> search ['검색어']
+//   node <…harness.cjs> execute '<프로그램>'          (작은따옴표 안은 셸이 해석하지 않는다)
+//   node <…harness.cjs> execute <<'EOF' … EOF          (따옴표 친 heredoc. 본문에 종료 줄이 또 있으면 거부)
+// 낱말 사이는 공백·탭만 받는다. 줄바꿈을 받으면 셸에서는 다음 줄이 별개의 명령이 된다 (`… search\nmake` → make 실행).
 let cliReal = null;
+const SP = '[ \\t]+';
+const CLI_PATH = String.raw`node${SP}(?:"([^"\`$;&|<>\\\n]*harness\.cjs)"|'([^'\`$;&|<>\n]*harness\.cjs)'|([^\s"'\`$;&|<>\\*?~(){}\[\]#!]*harness\.cjs))`;
+const PAD = '[ \\t\\n]*';   // 명령 앞뒤: 공백·탭·빈 줄만
+const RE_SIMPLE = new RegExp(String.raw`^${PAD}${CLI_PATH}${SP}(next|check|status)(?:${SP}--wait${SP}\d{1,3})?${PAD}$`);
+const RE_SEARCH = new RegExp(String.raw`^${PAD}${CLI_PATH}${SP}(search)(?:${SP}'[^'\n]*'|${SP}[\w.-]+)?${PAD}$`);
+const RE_EXEC_ARG = new RegExp(String.raw`^${PAD}${CLI_PATH}${SP}(execute)${SP}'[^']*'${PAD}$`);
+// heredoc 종료 줄은 종료어만 있어야 한다 (뒤에 공백이 붙으면 셸은 그 줄에서 끝내지 않는다 → 본문에 섞여 들어간다)
+const RE_EXEC_DOC = new RegExp(String.raw`^${PAD}${CLI_PATH}${SP}(execute)[ \t]*<<[ \t]*'(\w+)'[ \t]*\n([\s\S]*)\n\5\n*$`);
 function harnessCmd(root, cmd) {
   if (typeof cmd !== 'string') return null;
-  const m = cmd.match(/^\s*node\s+(?:"([^"`$;&|<>]*harness\.cjs)"|'([^'`$;&|<>]*harness\.cjs)'|([^\s"'`$;&|<>]*harness\.cjs))\s+(next|check|status)(?:\s+--wait\s+\d{1,3})?\s*$/);
+  let m = cmd.match(RE_SIMPLE) || cmd.match(RE_SEARCH) || cmd.match(RE_EXEC_ARG);
+  if (!m) {
+    m = cmd.match(RE_EXEC_DOC);
+    if (m && m[6].split('\n').some((l) => l === m[5])) m = null;   // 본문 중간의 종료 줄 = heredoc 뒤에 다른 명령이 붙는다
+  }
   if (!m) return null;
+  const file = m[1] || m[2] || m[3];
+  if (!path.isAbsolute(file)) return null;   // 상대 경로: hook 은 프로젝트 루트 기준으로, 셸은 그때의 작업 폴더 기준으로 푼다 → 다른 파일이 실행될 수 있다
   try {
     cliReal = cliReal || fs.realpathSync(HARNESS_CLI);
-    if (fs.realpathSync(path.resolve(root, m[1] || m[2] || m[3])) !== cliReal) return null;
+    if (fs.realpathSync(file) !== cliReal) return null;
   } catch { return null; }
   return m[4];
 }
+// 이 플러그인의 MCP 서버 도구인가 (scripts/mcp.cjs — 서버 이름 step-harness / step_harness. Devin 의 도구 이름은 mcp__<서버>__<도구>.
+// 플러그인이 띄운 서버에 접두사를 붙이는 클라이언트(mcp__plugin_<플러그인>_<서버>__<도구>)도 받는다)
+const isHarnessMcp = (tool) => /^mcp__(?:plugin_[\w-]+?_)?step[-_]?harness__(search|execute|check)$/.test(String(tool));
 const SHELL_META = /[;&|<>`\n]|\$\(/;
 function execAllowed(a, cmd) {
   if (!Array.isArray(a.exec_allow)) return true;
   if (typeof cmd !== 'string' || SHELL_META.test(cmd)) return false;
-  return a.exec_allow.some((re) => new RegExp(re).test(cmd.trim()));
+  return a.exec_allow.some((re) => new RegExp(`^(?:${re})`).test(cmd.trim()));   // 명령의 처음부터 맞아야 한다 ("rm -rf x #허용된 명령" 같은 꼬리로는 통과하지 못한다)
 }
 // 쓰기 범위·명령 범위 위반 여부. 위반이면 { why, detail }
 function scopeViolation(root, a, tool, input) {
@@ -213,7 +250,7 @@ function paramsMismatch(expected, input, skip) {
   return bad;
 }
 
-const kind = (a) => (a.tool ? 'call' : a.work ? 'work' : 'judge');
+const kind = (a) => (a.program ? 'program' : a.tool ? 'call' : a.work ? 'work' : 'judge');
 function effectivePassive(flow, a) {
   const s = new Set(flow.passive || DEFAULT_PASSIVE);
   for (const t of a.deny || []) s.delete(t);
@@ -239,6 +276,39 @@ function handoffQuestion(flow, state) {
   const tpl = flow.handoff_question || '[{flow}] {reason}. 어떻게 할까요? "retry"(다시 시도) / "proceed"(통과로 처리하고 계속) / "stop"(중단) 중 하나로 답해 주세요.';
   return tpl.replace('{flow}', flow.flow).replace('{reason}', (state.handoff && state.handoff.reason) || '사람의 결정이 필요함');
 }
+// 프로그램 모드의 프롬프트: 자연어 지시 대신 "타입이 있는 API + 제출 형식" (Code Mode)
+function renderProgram(flow, state, tag, why) {
+  const P = require('./program.cjs');
+  const a = flow.actions[state.action];
+  const reg = registry(flow.root || process.cwd());
+  const doneWhen = a.program.done_when || [];
+  const rej = state.rejected ? [`Your last program was REJECTED (${state.rejects}/${flow.max_visits}):`, ...state.rejected.map((e) => `  - ${e}`), 'Fix these and submit the whole program again.'] : [];
+  const nd = state.notDone ? [`Your last program returned h.done(), but the required gate "${state.notDone.gate}" FAILED (details: ${state.notDone.report}). The task is not finished — submit a new program that fixes it.`] : [];
+  return [tag, ...(nd.length ? nd : why), ...rej,
+    `TASK: ${a.program.task || '(see the user message)'}`,
+    'PROGRAM — do not do the work yourself. Write ONE program against this API; the harness verifies it and runs it:',
+    '```ts', P.declaration(reg, doneWhen), '```',
+    'h.check runs a registered gate (r.pass · r.route · r.report = path of its output).',
+    'h.skill / h.agent start a separate worker that may write only inside `scope` (r.ok). A worker cannot see this conversation: put everything it needs into its args/task.' +
+      (Array.isArray(reg.writable) ? '' : ' A scope entry is a relative glob that starts with a real directory or file name of this project (e.g. "lib/**").'),
+    'Grammar: exactly one `async (h) => { … }`. Only const · if/else · for (const i of h.retries(N)) · break/continue · return · await h.<method>(…) · === !== && || ! · template literals.',
+    'Every path must end with `return h.done("…")` or `return h.handoff("…")`. No let/while/functions/imports/other calls, no ternary, no + or < >.',
+    'Shape (adapt it; names and scopes must fit the API above):',
+    '```ts', P.example(reg, doneWhen), '```',
+    'NEXT_ACTION — submit it with exactly this tool (the program goes between the EOF lines):',
+    '  tool: exec',
+    `  params: ${JSON.stringify({ command: `node "${HARNESS_CLI}" execute <<'EOF'\n<program>\nEOF` })}`,
+    `Optional, before that: ${cli('search')} lists the registered gates/skills/agents with descriptions. Everything else is blocked (read-only tools excepted).`,
+  ].join('\n');
+}
+// 작업자 기본값: config 에 "worker" 가 없으면 Devin 비대화 모드로 띄운다 ("worker": null 이면 끔)
+const DEFAULT_WORKER = 'devin -p --prompt-file {prompt_file} --permission-mode accept-edits --respect-workspace-trust false';
+// 프로그램 API 에 노출할 등록부 (.step-harness/config.json): gates · skills · agents · writable · worker
+function registry(root) {
+  const c = config(root);
+  return { gates: c.gates || {}, skills: c.skills, agents: c.agents, writable: c.writable, worker: c.worker === undefined ? DEFAULT_WORKER : (c.worker || null) };
+}
+const gateCmd = (g) => (typeof g === 'string' ? g : (g && typeof g.cmd === 'string' ? g.cmd : '')).trim();
 function renderNext(flow, state) {
   if (!flow || !state) return '';
   const head = `[step-harness] flow=${flow.flow}`;
@@ -256,6 +326,13 @@ function renderNext(flow, state) {
   const checkCall = ['  tool: exec', `  params: ${JSON.stringify({ command: cli('check') })}`];
   const last = (state.history || []).slice(-1)[0];   // 왜 다시 하라는지 한 줄 (같은 지시가 반복돼 보이지 않게)
   const why = last && !last.pass ? [`The last verification FAILED (${last.action}${last.route ? `, route=${last.route}` : ''})${last.report ? `; details: ${last.report}` : ''}. So:`] : [];
+  if (k === 'program') {
+    if (fresh(state.inFlight)) {
+      return [tag, 'The program is running (its workers do the edits). NEXT_ACTION — call exactly this tool with exactly these params, now:', ...checkCall,
+        'It prints each step and the result. If it prints STILL RUNNING, call it again. Everything else is blocked.'].join('\n');
+    }
+    return renderProgram(flow, state, tag, why);
+  }
   if (k === 'judge' || (k === 'call' && fresh(state.receipt)) || (k === 'work' && state.workDone)) {
     return [tag, 'NEXT_ACTION — call exactly this tool with exactly these params, now:', ...checkCall,
       'It prints the verdict and the next action. If it prints STILL RUNNING, call it again. Everything else is blocked.'].join('\n');
@@ -278,5 +355,5 @@ module.exports = {
   DIR, PLUGIN_DIR, HARNESS_CLI, DEVIN_TOOLS, FILE_MUTATORS, NEVER_PASSIVE, DEFAULT_PASSIVE,
   normTool, isKnownTool, findRoot, sp, readJson, writeJson, append, log, load, saveState, config, subagentMode, learn,
   sleep, alive, withLock, inside, inScope, globToRe, targetPaths, touchesHarness, harnessCmd, scopeViolation,
-  paramsMismatch, kind, effectivePassive, isDup, shq, cli, handoffQuestion, renderNext,
+  paramsMismatch, kind, effectivePassive, isDup, shq, cli, handoffQuestion, renderNext, isHarnessMcp, registry, gateCmd,
 };

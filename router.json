@@ -1,5 +1,17 @@
 {
   "routes": [
-    { "name": "smoke test", "when": "^/?harness smoke$", "flow": "flows/smoke.flow.yaml", "args": {} }
+    {
+      "name": "smoke test",
+      "when": "^/?harness smoke$",
+      "flow": "flows/smoke.flow.yaml",
+      "args": {}
+    },
+    {
+      "name": "program",
+      "when": "^\\s*(?:프로그램|program)\\s*[:：]\\s*([\\s\\S]+)",
+      "program": {
+        "task": "$1"
+      }
+    }
   ]
 }

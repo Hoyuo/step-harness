@@ -11,6 +11,11 @@
       "when": "^fix:\\s*(\\S+)",
       "flow": "flows/delegate.flow.yaml",
       "args": { "target": "$1", "verify": "flutter analyze lib" }
+    },
+    {
+      "name": "code complete (program mode)",
+      "when": "^/?ccp\\b",
+      "program": { "task": "코드 컴플리트 게이트를 통과시킨다", "done_when": ["code-complete"] }
     }
   ]
 }

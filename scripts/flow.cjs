@@ -84,12 +84,32 @@ function lint(f) {
   return E;
 }
 
+// 셸 명령 문자열에 인자를 넣는다. 프롬프트에서 뽑은 값(untrusted)은 작은따옴표로 감싸 넣는데,
+// flow 작성자가 이미 '{x}' 나 "… {x} …" 처럼 따옴표 안에 둔 자리라면 그 따옴표를 잠깐 닫았다가 다시 연다.
+// (그냥 감싸 넣으면 ''값'' 이 되어 따옴표가 상쇄되고, 큰따옴표 안에서는 $( ) 가 실행된다)
+function subShell(v, args, untrusted) {
+  let out = '';
+  let q = null;   // 지금 위치의 따옴표 상태: null | "'" | '"'
+  for (let i = 0; i < v.length; i++) {
+    const c = v[i];
+    const m = c === '{' ? /^\{(\w+)\}/.exec(v.slice(i)) : null;
+    if (m && m[1] in args) {
+      const val = String(args[m[1]]);
+      out += untrusted.has(m[1]) ? (q ? q + L.shq(val) + q : L.shq(val)) : val;
+      i += m[0].length - 1;
+      continue;
+    }
+    if (c === '\\' && q !== "'") { out += c + (v[i + 1] || ''); i++; continue; }
+    if (c === "'" && q !== '"') q = q ? null : "'";
+    else if (c === '"' && q !== "'") q = q ? null : '"';
+    out += c;
+  }
+  return out;
+}
 function sub(v, args, shell, untrusted) {
   if (typeof v === 'string') {
-    return v.replace(/\{(\w+)\}/g, (all, k) => {
-      if (!(k in args)) return all;
-      return shell && untrusted.has(k) ? L.shq(args[k]) : String(args[k]);   // 프롬프트에서 뽑은 값이 셸로 갈 때는 따옴표 처리
-    });
+    if (shell) return subShell(v, args, untrusted);
+    return v.replace(/\{(\w+)\}/g, (all, k) => (k in args ? String(args[k]) : all));
   }
   if (Array.isArray(v)) return v.map((x) => sub(x, args, shell, untrusted));
   if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, sub(x, args, shell, untrusted)]));
@@ -122,7 +142,7 @@ function handoff(flow, state, reason) {
     handoff: { from: state.action, reason, promptId: state.lastPromptId || null, announced: false } };
 }
 function enter(flow, state, target, reason) {
-  const s = { ...state, receipt: null, inFlight: null, workDone: false, blocks: 0, idle: 0, stopBlocks: 0 };
+  const s = { ...state, receipt: null, inFlight: null, workDone: false, blocks: 0, idle: 0, stopBlocks: 0, rejects: 0, rejected: null, notDone: null, exec: null };
   if (target === 'done') return { ...s, status: 'done', action: null, seq: s.seq + 1 };
   if (target === 'handoff') return handoff(flow, s, reason || `${state.action}: flow 정의에 따라 사람에게 넘김`);
   const a = flow.actions[target];
@@ -179,9 +199,33 @@ function start(root, file, given = {}, opts = {}) {
   L.log(root, { ev: 'start', flow: flow.flow, run: state.run, args: given, file });
   return { flow, state };
 }
+// 프로그램 모드 흐름: 액션 하나(program). 모델이 프로그램을 내고(execute) 검증을 통과하면 분리된 프로세스가 실행한다.
+//   done_when: 프로그램이 h.done() 을 돌려줘도, 여기 적힌 게이트를 하네스가 직접 돌려 통과해야 끝난 것으로 친다
+//              (규칙의 program.done_when, 없으면 config.json 의 done_when). "끝났다"는 판정은 모델이 아니라 코드가 한다.
+function startProgram(root, opts = {}) {
+  const task = opts.task || '';
+  const reg = L.registry(root);
+  const raw = opts.doneWhen != null ? opts.doneWhen : L.config(root).done_when;
+  const doneWhen = [...new Set([].concat(raw == null ? [] : raw).map(String))];
+  const bad = doneWhen.filter((g) => !Object.prototype.hasOwnProperty.call(reg.gates, g) || !L.gateCmd(reg.gates[g]));
+  if (bad.length) return { error: `done_when names a gate that is not registered in ${L.DIR}/config.json "gates": ${bad.join(', ')}` };
+  const flow = { flow: 'program', root, args: {}, start: 'program', done: task ? `${task}: done` : 'program finished',
+    actions: { program: { id: 'program', program: { task, done_when: doneWhen }, on: { pass: 'done' } } } };
+  for (const [k, d] of Object.entries(DEFAULTS)) flow[k] = d;
+  let state = { v: 3, run: crypto.randomBytes(4).toString('hex'), status: 'running', mode: 'session', action: null, seq: 0, steps: 0,
+    visits: {}, receipt: null, inFlight: null, workDone: false, blocks: 0, idle: 0, stopBlocks: 0, history: [], handoff: null, rejects: 0, rejected: null,
+    mainSession: opts.session || null, lastPromptId: opts.promptId || null, startedAt: new Date().toISOString() };
+  state = enter(flow, state, 'program');
+  L.writeJson(L.sp(root, 'flow.json'), flow);
+  L.saveState(root, state);
+  const gi = L.sp(root, '.gitignore');
+  if (!fs.existsSync(gi)) { try { fs.writeFileSync(gi, '*\n!.gitignore\n!router.json\n!config.json\n'); } catch { /* 무시 */ } }
+  L.log(root, { ev: 'start', flow: 'program', run: state.run, task });
+  return { flow, state };
+}
 function resolveFlowPath(root, p) {
   for (const base of [root, L.PLUGIN_DIR]) { const f = path.resolve(base, p); if (fs.existsSync(f)) return f; }
   return path.resolve(root, p);
 }
 
-module.exports = { loadFile, lint, compile, start, enter, advance, handoff, answer, resolveFlowPath, DEFAULTS, BUILTINS };
+module.exports = { loadFile, lint, compile, start, startProgram, enter, advance, handoff, answer, resolveFlowPath, DEFAULTS, BUILTINS };
