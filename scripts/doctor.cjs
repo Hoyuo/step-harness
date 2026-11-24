@@ -72,6 +72,24 @@ function doctor(root, { has, out }) {
   const cfg = L.config(root);
   out(`config: subagent_hooks=${cfg.subagent_hooks} (현재 동작: ${L.subagentMode(root)}) · wait=${JSON.stringify(cfg.wait)} · auto_approve_cli=${cfg.auto_approve_cli}`);
 
+  const reg = L.registry(root);
+  const wbin = reg.worker && reg.worker.trim().split(/\s+/)[0];
+  const sh = (line) => require('child_process').spawnSync('/bin/sh', ['-c', line], { cwd: root }).status === 0;
+  const onPath = wbin && sh(`command -v ${L.shq(wbin)}`);
+  const doneWhen = [].concat(cfg.done_when || []);
+  out(`프로그램 모드: 게이트 ${Object.keys(reg.gates).length}개 · 스킬 ${reg.skills ? Object.keys(reg.skills).length + '개' : '제한 없음'} · 작업자 ${reg.worker ? `"${wbin}" ${onPath ? '(PATH 에 있음)' : '⚠ PATH 에 없음 → h.skill/h.agent 실행이 실패한다'}` : '⚠ 없음'}`);
+  out(`  완료 조건(done_when): ${doneWhen.length ? doneWhen.join(', ') + ' — h.done() 뒤에 하네스가 직접 돌린다' : '없음 → 규칙의 program.done_when 이 없으면 프로그램의 h.done() 을 그대로 받아들인다'}`);
+  const noCmd = Object.entries(reg.gates).filter(([, g]) => !L.gateCmd(g)).map(([k]) => k);
+  if (noCmd.length) out(`  ⚠ 명령(cmd)이 없는 게이트: ${noCmd.join(', ')}`);
+  const badDone = doneWhen.filter((g) => !Object.prototype.hasOwnProperty.call(reg.gates, g));
+  if (badDone.length) out(`  ⚠ done_when 에 등록되지 않은 게이트: ${badDone.join(', ')} → 프로그램 모드가 시작되지 않는다`);
+  if (!Array.isArray(reg.writable)) out('  쓰기 범위(writable) 미설정 → 프로그램이 범위를 고른다 (숨김 경로·와일드카드로 시작하는 범위는 거부)');
+  const sb = process.platform === 'darwin' && fs.existsSync('/usr/bin/sandbox-exec');
+  out(`  작업자 샌드박스(worker_sandbox): ${cfg.worker_sandbox ? (sb ? '켜짐 — 작업자의 프로세스 트리는 하네스 상태·hook 등록·git hook 에 쓸 수 없다' : '⚠ 켜져 있지만 이 OS 에서는 쓸 수 없음 → 작업 단계가 실패한다') : `꺼짐${sb ? ' (실험적 옵션. 작업자가 상태 파일을 직접 고치는 것까지 막으려면 "worker_sandbox": true — 막는 범위는 README 의 "한계" 참고)' : ''}`}`);
+  if (cfg.scope_check === false) out('  ⚠ scope_check=false → 작업자의 범위 밖 변경을 실행 뒤에 확인하지 않는다');
+  else if (!sh('git rev-parse --show-toplevel >/dev/null 2>&1')) out('  ⚠ git 저장소가 아님 → 작업자의 범위 밖 변경을 실행 뒤에 확인할 수 없다 (hook 의 파일 도구 검사만 적용)');
+  out(`  MCP: 플러그인의 .mcp.json 으로 등록된다. Devin 의 /mcp 에 step-harness 가 없으면: devin mcp add step-harness -- node "${path.join(L.PLUGIN_DIR, 'scripts', 'mcp.cjs')}"`);
+
   const pf = L.sp(root, 'probe.jsonl');
   if (!fs.existsSync(pf)) return out('\nprobe 기록 없음 → `harness.cjs probe on` 후 안내된 프롬프트를 Devin 에서 실행.');
   const rows = fs.readFileSync(pf, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
