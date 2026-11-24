@@ -199,7 +199,8 @@ function start(root, file, given = {}, opts = {}) {
   L.log(root, { ev: 'start', flow: flow.flow, run: state.run, args: given, file });
   return { flow, state };
 }
-// 프로그램 모드 흐름: 액션 하나(program). 모델이 프로그램을 내고(execute) 검증을 통과하면 분리된 프로세스가 실행한다.
+// 프로그램 흐름: 처음에는 액션 하나(program = 계획 단계). 모델이 프로그램을 내고(execute) 검증을 통과하면,
+//   그 프로그램의 걸음이 하나씩 액션으로 덧붙는다 (steps.cjs). lazy = 프롬프트의 규칙이 아니라 "무언가를 바꾸려는 호출"로 시작된 흐름.
 //   done_when: 프로그램이 h.done() 을 돌려줘도, 여기 적힌 게이트를 하네스가 직접 돌려 통과해야 끝난 것으로 친다
 //              (규칙의 program.done_when, 없으면 config.json 의 done_when). "끝났다"는 판정은 모델이 아니라 코드가 한다.
 function startProgram(root, opts = {}) {
@@ -209,11 +210,15 @@ function startProgram(root, opts = {}) {
   const doneWhen = [...new Set([].concat(raw == null ? [] : raw).map(String))];
   const bad = doneWhen.filter((g) => !Object.prototype.hasOwnProperty.call(reg.gates, g) || !L.gateCmd(reg.gates[g]));
   if (bad.length) return { error: `done_when names a gate that is not registered in ${L.DIR}/config.json "gates": ${bad.join(', ')}` };
-  const flow = { flow: 'program', root, args: {}, start: 'program', done: task ? `${task}: done` : 'program finished',
+  const flow = { flow: 'program', root, args: {}, start: 'program', done: 'the program finished',
     actions: { program: { id: 'program', program: { task, done_when: doneWhen }, on: { pass: 'done' } } } };
   for (const [k, d] of Object.entries(DEFAULTS)) flow[k] = d;
+  flow.max_idle_calls = 60;   // 계획을 세우거나 직접 작업하는 동안에는 읽을 것이 많다
+  // 언제든 써도 되는 읽기 전용 도구 (config.passive_tools 로 더할 수 있다: 예를 들어 문서를 찾아 주는 MCP 도구)
+  flow.passive = [...new Set([...L.DEFAULT_PASSIVE, 'webfetch', 'web_search', 'mcp_list_servers', 'mcp_list_tools', 'mcp_read_resource', ...[].concat(L.config(root).passive_tools || [])])];
   let state = { v: 3, run: crypto.randomBytes(4).toString('hex'), status: 'running', mode: 'session', action: null, seq: 0, steps: 0,
     visits: {}, receipt: null, inFlight: null, workDone: false, blocks: 0, idle: 0, stopBlocks: 0, history: [], handoff: null, rejects: 0, rejected: null,
+    lazy: !!opts.lazy, planned: false, trace: [], doneChecked: [],
     mainSession: opts.session || null, lastPromptId: opts.promptId || null, startedAt: new Date().toISOString() };
   state = enter(flow, state, 'program');
   L.writeJson(L.sp(root, 'flow.json'), flow);

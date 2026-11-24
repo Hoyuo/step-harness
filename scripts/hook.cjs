@@ -2,6 +2,7 @@
 'use strict';
 // 단일 hook 엔트리. hook_event_name 으로 분기한다.
 //   PreToolUse       — NEXT_ACTION(도구+params 정확 일치)·읽기 전용 도구·하네스 CLI 만 통과. 나머지 차단
+//                      흐름이 없을 때: 읽기는 자유, 무언가를 바꾸려는 호출은 막고 계획(프로그램) 단계를 시작한다 (config.plan = "always")
 //   PostToolUse      — receipt 를 hook 이 기록(모델의 자가 보고 없음)하고, 갈 수 있는 데까지 자동 진행
 //   UserPromptSubmit — 라우터(자연어 → flow, LLM 없음) · 매 턴 NEXT_ACTION 주입 · handoff 답 처리
 //   Stop             — 흐름이 끝나기 전에는 종료 불가. 판정이 끝나길 잠깐 기다렸다가 직접 다음 단계로 넘김
@@ -12,12 +13,10 @@ const path = require('path');
 const L = require('./lib.cjs');
 const F = require('./flow.cjs');
 const J = require('./judge.cjs');
+const S = require('./steps.cjs');
 
 const fresh = (state, x) => !!x && x.seq === state.seq;
 const live = (flow, state) => !!(flow && state && (state.status === 'running' || state.status === 'handoff'));
-// 하네스가 띄운 작업자(러너·프로그램 모드)의 hook: 환경변수 STEP_HARNESS_WORKER=<run>:<seq> 를 물려받는다
-//   그 실행(run)의 그 단계(seq)가 아직 돌고 있을 때만 "작업자"로 인정한다
-const isWorker = (C, state) => !!(C.worker && state && state.status === 'running' && C.worker === `${state.run}:${state.seq}`);
 const isForeign = (state, ev) => !!(state.mainSession && ev.session_id && ev.session_id !== state.mainSession);
 
 // ───────── 출력
@@ -34,7 +33,7 @@ function announce(C) {
   if (C.R.code !== 0) return;
   L.withLock(C.root, () => {
     const { flow, state } = L.load(C.root);
-    if (!flow || !state || state.status !== 'handoff' || !state.handoff || state.mode === 'runner') return;
+    if (!flow || !state || state.status !== 'handoff' || !state.handoff) return;
     if (isForeign(state, C.ev)) return;   // 서브에이전트의 이벤트로는 턴을 끝내지 않는다
     const sameTurn = !C.ev.prompt_id || C.ev.prompt_id === state.handoff.promptId;
     if (!sameTurn) return;                // 다음 턴부터는 사람이 주도한다
@@ -55,26 +54,19 @@ function preToolUse(C) {
   const allow = (why) => { if (active) L.log(root, { ...base, decision: 'allow', why }); };
 
   // 하네스 명령을 쓰긴 했는데 허용 형태가 아닌 경우(앞에 cd, 뒤에 다른 명령 …): 차단은 같고, 무엇이 틀렸는지를 알려준다
-  const nearMiss = !cliSub && tool === 'exec' && /harness\.cjs["']?[ \t]+(next|check|status|search|execute)\b/.test(String(input.command || ''));
+  const nearMiss = !cliSub && tool === 'exec' && /harness\.cjs["']?[ \t]+(next|check|status|plan|search|execute)\b/.test(String(input.command || ''));
   if (!cliSub && L.touchesHarness(root, tool, input, active)) {
     return deny('protected', `[step-harness] BLOCKED ${tool}: ` + (nearMiss ? CLI_FORM : `harness files (${L.DIR}/ and the plugin) are read-only for you.`) + (active ? `\n${L.renderNext(flow, state)}` : ''));
   }
-  // 하네스가 띄운 작업자(러너·프로그램 모드): 순서는 스크립트가 쥐고 있다. 여기서는 쓰기 범위만 지킨다
-  const workerScope = () => {
-    const cur = flow.actions[state.action];
-    let v = L.scopeViolation(root, cur, tool, input);
-    if (!v && L.kind(cur) === 'program' && !cur.write_scope && L.FILE_MUTATORS.has(tool)) v = { why: 'write-scope', detail: 'no worker step with a write scope is running.' };
-    return v ? deny(v.why, `[step-harness] BLOCKED ${tool}: ${v.detail}`) : allow('worker');
-  };
-  if (C.worker) {
-    if (isWorker(C, state)) return workerScope();
-    // 그 실행은 끝났거나 멈췄다 (사람에게 넘어감 · 중단 · 다른 실행) → 남아 있는 작업자는 읽기만 할 수 있다
-    if (!state || L.DEFAULT_PASSIVE.includes(tool)) return;   // 이 프로젝트에 실행 기록이 아예 없으면 관여하지 않는다
-    return deny('stale-worker', `[step-harness] BLOCKED ${tool}: the harness run that started this worker has ended. Do not change anything. Stop now. ` +
-      '(This process carries STEP_HARNESS_WORKER from that run; a normal session must be started without that variable.)');
+  if (!active) {
+    // 계획 먼저: 흐름이 없을 때는 읽고 답하는 것만 자유다. 무언가를 바꾸려는 첫 호출에서 계획 단계를 시작하고, 그 호출은 막는다
+    if (cliSub || L.isHarnessMcp(tool) || L.config(root).plan !== 'always' || !L.needsPlan(root, tool, input)) return;
+    const last = L.readJson(L.sp(root, 'last-prompt.json'), null) || {};
+    const res = F.startProgram(root, { task: last.prompt || '', session: ev.session_id, promptId: ev.prompt_id, lazy: true });
+    L.log(root, { ...base, decision: 'block', why: 'plan-first', started: !res.error });
+    if (res.error) return blockTool(C, `[step-harness] BLOCKED ${tool}: this project requires a plan before any change, but the plan step could not start: ${res.error}`);
+    return blockTool(C, `[step-harness] BLOCKED ${tool}: in this project nothing may be changed before a plan is accepted.\n${L.renderNext(res.flow, res.state)}`);
   }
-  if (!active) return;
-  if (state.mode === 'runner') return state.status === 'running' ? workerScope() : allow('worker');
 
   let dirty = false;
   const dup = L.isDup(state, ev, C.src); dirty = true;
@@ -86,6 +78,7 @@ function preToolUse(C) {
   if (dup && state.lastEvent.allowed === true) return pass('duplicate-hook');   // 다른 설치본이 방금 통과시킨 바로 그 호출
 
   if (cliSub) return pass('harness-cli');
+  if (L.isHarnessMcp(tool)) return pass('harness-mcp');   // search · execute · check — 상태에 맞지 않는 호출은 CLI 가 거절한다
   const passiveBase = new Set(flow.passive || L.DEFAULT_PASSIVE);
 
   if (state.status === 'handoff') {   // 사람 차례. handoff 가 난 그 턴에는 읽기 외 금지 (넘기는 척하고 계속 고치는 것 방지)
@@ -101,7 +94,7 @@ function preToolUse(C) {
   const a = flow.actions[state.action];
   const k = L.kind(a);
   let inFlight = fresh(state, state.inFlight);
-  if (inFlight && k !== 'program' && (Date.now() - Date.parse(state.inFlight.since)) / 1000 > flow.inflight_ttl_sec) { state.inFlight = null; inFlight = false; }
+  if (inFlight && (Date.now() - Date.parse(state.inFlight.since)) / 1000 > flow.inflight_ttl_sec) { state.inFlight = null; inFlight = false; }
   const mode = L.subagentMode(root);
   if (foreign && inFlight && mode === 'same' && !(L.readJson(L.sp(root, 'caps.json'), {}) || {}).foreign_seen) {
     L.learn(root, { foreign_seen: new Date().toISOString() });   // 관측만 기록 (doctor 가 알려준다)
@@ -124,14 +117,12 @@ function preToolUse(C) {
     return v ? block(v.why, v.detail, worker) : pass(why);
   };
 
-  if (foreign && k !== 'program') {   // 메인이 아닌 세션 = 위임된 작업자(서브에이전트) 또는 같은 폴더의 다른 세션
+  if (foreign) {   // 메인이 아닌 세션 = 위임된 작업자(서브에이전트) 또는 같은 폴더의 다른 세션
     if (inFlight) return scoped('worker', true);
     if (passiveBase.has(tool)) return pass('foreign-passive');
     return block('locked', 'the workspace is locked by a running flow that belongs to another session.', true);
   }
 
-  if (k === 'program' && !inFlight && L.isHarnessMcp(tool)) return pass('program-mcp');
-  if (k === 'program' && inFlight && /__check$/.test(tool) && L.isHarnessMcp(tool)) return pass('program-mcp');
   if (k === 'call') {
     if (tool === a.tool && !inFlight && !fresh(state, state.receipt)) {
       const bad = L.paramsMismatch(a.params, input, a.rewrite);
@@ -147,6 +138,12 @@ function preToolUse(C) {
   } else if (k === 'work' && !state.workDone && (a.allow || []).includes(tool)) {
     state.idle = 0;
     return scoped('work', false);
+  } else if (k === 'work' && !state.workDone && a.allow_mcp && (tool === 'mcp_call_tool' || /^mcp__/.test(tool))) {
+    // 작업 걸음의 MCP 도구: 무엇을 하는지는 알 수 없다. 입력에 파일 경로가 보이면 쓰기 범위만 지킨다
+    state.idle = 0;
+    const t = L.targetPaths('write', input.arguments && typeof input.arguments === 'object' ? input.arguments : input);
+    const bad = t && Array.isArray(a.write_scope) ? t.find((p) => !L.inScope(root, a.write_scope, p)) : null;
+    return bad ? block('write-scope', `${bad} is outside the writable paths (${a.write_scope.join(', ')}).`) : pass('work-mcp');
   }
 
   if (L.effectivePassive(flow, a).has(tool)) {
@@ -166,7 +163,7 @@ function postToolUse(C) {
   let got = false;
   L.withLock(root, () => {
     const { flow, state } = L.load(root);
-    if (!flow || !state || state.status !== 'running' || state.mode === 'runner' || isForeign(state, ev)) return;
+    if (!flow || !state || state.status !== 'running' || isForeign(state, ev)) return;
     const a = flow.actions[state.action];
     const k = L.kind(a);
     const r = ev.tool_response || {};
@@ -178,7 +175,7 @@ function postToolUse(C) {
         sid: ev.session_id, pid: ev.prompt_id, input, error: r.error || null, output_tail: String(r.output || '').slice(-400) });
       L.log(root, { ev: 'PostToolUse', tool, action: a.id, receipt: ok });
       got = true;
-    } else if (k === 'work' && !state.workDone && ok && (a.allow || []).includes(tool)) {
+    } else if (k === 'work' && !state.workDone && ok && ((a.allow || []).includes(tool) || (a.allow_mcp && (tool === 'mcp_call_tool' || /^mcp__/.test(tool)) && !L.isHarnessMcp(tool)))) {
       const rc = fresh(state, state.receipt) ? state.receipt : { seq: state.seq, ok: true, tool: 'work', mutations: 0, at: new Date().toISOString() };
       rc.mutations += 1;
       state.receipt = rc;
@@ -195,7 +192,7 @@ function postToolUse(C) {
 const ANSWERS = [[/^(retry|재시도|다시|다시\s*해|다시\s*시도)$/i, 'retry'], [/^(proceed|진행|진행해|통과|넘어가)$/i, 'proceed'], [/^(stop|중단|그만|취소)$/i, 'stop']];
 function userPromptSubmit(C) {
   const { ev, root } = C;
-  const prompt = String(ev.prompt || '').trim();
+  const prompt = String(ev.prompt || ev.user_prompt || '').trim();   // 호스트에 따라 필드 이름이 다르다
   const word = prompt.replace(/^["'\s]+|["'\s.!~]+$/g, '');
   let { flow, state } = L.load(root);
   const active = live(flow, state);
@@ -213,8 +210,6 @@ function userPromptSubmit(C) {
     }
     return ctxOut(C, '[step-harness] The user stopped the flow. Harness restrictions are lifted. Acknowledge in one sentence.');
   }
-  if (active && state.mode === 'runner') return;
-
   if (active && state.status === 'handoff') {
     const hit = ANSWERS.find(([re]) => re.test(word));
     if (!hit) {
@@ -223,7 +218,7 @@ function userPromptSubmit(C) {
     }
     L.withLock(root, () => {
       const cur = L.load(root);
-      const next = F.answer(cur.flow, cur.state, hit[1]);
+      const next = S.answer(root, cur.flow, cur.state, hit[1]);
       L.saveState(root, { ...next, mainSession: ev.session_id || next.mainSession, lastPromptId: ev.prompt_id || null });
     });
     L.log(root, { ev: 'handoff-answer', answer: hit[1] });
@@ -234,19 +229,18 @@ function userPromptSubmit(C) {
   if (active) {
     // NEXT_ACTION 실행 중에 다른 session_id 로 온 프롬프트는 서브에이전트의 것일 수 있다 → 끼어들지 않는다.
     // 그 외에 다른 세션에서 온 프롬프트는 사람이 새 세션으로 돌아온 것 → 그 세션을 메인으로 삼는다.
-    //   (프로그램 모드에는 서브에이전트가 없다. 작업자는 별도 프로세스이고 그 이벤트는 handle() 에서 걸러진다)
-    const prog = state.status === 'running' && L.kind(flow.actions[state.action]) === 'program';
-    if (!prog && isForeign(state, ev) && fresh(state, state.inFlight)) return;
+    if (isForeign(state, ev) && fresh(state, state.inFlight)) return;
     L.withLock(root, () => {
-      const cur = L.load(root);   // 메인의 새 턴 = 이전 턴의 도구 호출은 끝났다 → PostToolUse 없이 남은 실행 구간을 닫는다
-      const s = cur.state;          // (프로그램 실행 구간은 예외: 분리된 프로세스가 아직 돌고 있을 수 있다)
+      const s = L.load(root).state;   // 메인의 새 턴 = 이전 턴의 도구 호출은 끝났다 → PostToolUse 없이 남은 실행 구간을 닫는다
       if (s.status !== 'running') return;
-      const keep = L.kind(cur.flow.actions[s.action]) === 'program';
-      L.saveState(root, { ...s, inFlight: keep ? s.inFlight : null, mainSession: ev.session_id || s.mainSession, lastPromptId: ev.prompt_id || s.lastPromptId });
+      L.saveState(root, { ...s, inFlight: null, mainSession: ev.session_id || s.mainSession, lastPromptId: ev.prompt_id || s.lastPromptId });
     });
     J.settle(root, { trigger: 'prompt', waitMs: wait });
     return inject();
   }
+
+  // 계획 단계를 나중에(무언가를 바꾸려 할 때) 시작하게 되면 이 프롬프트가 그 과제(TASK)다
+  if (prompt) { try { L.writeJson(L.sp(root, 'last-prompt.json'), { prompt: prompt.slice(0, 4000), sid: ev.session_id || null, pid: ev.prompt_id || null, at: new Date().toISOString() }); } catch { /* 기록 실패로 막지 않는다 */ } }
 
   // 라우터: 자연어 → flow (정규식 규칙. 판단은 코드가 한다)
   // 프로젝트 규칙이 먼저: 프로젝트 규칙에 맞는 게 있으면 플러그인 기본 규칙은 보지 않는다
@@ -260,7 +254,14 @@ function userPromptSubmit(C) {
     }
     if (hits.length) break;
   }
-  if (!hits.length) return;
+  if (!hits.length) {
+    // 규칙에 걸리지 않은 보통의 프롬프트: 읽고 답하는 것은 자유, 무언가를 바꾸려면 먼저 계획을 내야 한다는 것만 알린다 (흐름은 아직 시작하지 않는다)
+    if (L.config(root).plan === 'always') {
+      ctxOut(C, '[step-harness] This project is plan-first. You may read files and answer questions freely. To change anything (edit files, run commands that change something, ' +
+        `use skills or subagents) you must first submit a plan: run exactly \`${L.cli('plan')}\` — it prints the plan API and how to submit. Direct changes are blocked until a plan is accepted.`);
+    }
+    return;
+  }
   if (hits.length > 1) {
     L.log(root, { ev: 'route', ambiguous: hits.map((h) => h.r.name || h.r.flow) });
     return ctxOut(C, `[step-harness] The request matches more than one flow (${hits.map((h) => h.r.name || h.r.flow).join(' / ')}). ` +
@@ -287,7 +288,7 @@ function userPromptSubmit(C) {
 function stop(C) {
   const { ev, root } = C;
   let { flow, state } = L.load(root);
-  if (!live(flow, state) || state.mode === 'runner' || isForeign(state, ev)) return;
+  if (!live(flow, state) || isForeign(state, ev)) return;
   const tellHuman = () => {   // handoff: 아직 알리지 않았다면 한 번만 막고 사람에게 전하게 한다
     let first = false;
     L.withLock(root, () => {
@@ -297,14 +298,20 @@ function stop(C) {
     if (first) blockStop(C, L.renderNext(flow, state));
   };
   if (state.status === 'handoff') return tellHuman();
+  // 계획 단계에서(받아들여진 프로그램이 아직 없는데) 멈추려 한다 = 바뀐 것이 없다 → 막지 않고, 시작만 해 둔 계획 단계는 접는다.
+  //   (사용자가 규칙으로 명시해서 시작한 흐름은 접지 않는다: 프로그램을 낼 때까지 멈출 수 없다)
+  if (state.lazy && !state.planned && L.kind(flow.actions[state.action]) === 'program') {
+    L.withLock(root, () => { const s = L.load(root).state; if (s.status === 'running' && s.lazy && !s.planned) L.saveState(root, { ...s, status: 'stopped' }); });
+    L.log(root, { ev: 'Stop', decision: 'allow', why: 'plan-not-submitted' });
+    return;
+  }
 
   const cfg = L.config(root);
   let midFlight = false;
   L.withLock(root, () => {
     const s = L.load(root).state;
     if (s.status !== 'running') return;
-    const prog = L.kind(flow.actions[s.action]) === 'program';   // 프로그램 실행 중: 아래 settle 로 가서 기다린다 (실행 구간은 건드리지 않는다)
-    if (fresh(s, s.inFlight) && !prog) {
+    if (fresh(s, s.inFlight)) {
       // NEXT_ACTION 실행 구간 중의 Stop. 서브에이전트의 종료일 수도, PostToolUse 없이 끝난(취소 등) 메인의 종료일 수도 있다.
       //   기본: 건드리지 않는다 (종료 허용). 메인이었다면 다음 프롬프트에서 실행 구간을 닫고 NEXT_ACTION 을 다시 준다.
       //   PostToolUse 가 원래 안 오는 환경이면 config.assume_done_on_stop 으로 "호출됨"으로 친다 (성공 여부는 어차피 check 가 판정).
@@ -320,8 +327,7 @@ function stop(C) {
   ({ flow, state } = L.load(root));
   if (settled === 'pending' && state.status === 'running') {   // 판정이 아직 도는 중 — 횟수는 세지 않는다 (판정에는 자체 시간 제한이 있다)
     L.log(root, { ev: 'Stop', decision: 'block', why: 'verifying' });
-    const what = L.kind(flow.actions[state.action]) === 'program' ? 'program' : 'verification';
-    return blockStop(C, `[step-harness] You cannot stop yet: the ${what} is still running.\n${L.renderNext(flow, state)}`);
+    return blockStop(C, `[step-harness] You cannot stop yet: the verification is still running.\n${L.renderNext(flow, state)}`);
   }
   if (state.status === 'done') {   // 이 Stop 안에서 흐름이 끝났다 → 결과를 사용자에게 전하도록 한 번만 붙잡는다 (다음 Stop 은 통과)
     L.log(root, { ev: 'Stop', decision: 'block', why: 'report-done' });
@@ -352,9 +358,8 @@ function stop(C) {
 
 function sessionStart(C) {
   const { flow, state } = L.load(C.root);
-  if (!live(flow, state) || state.mode === 'runner') return;
-  const prog = state.status === 'running' && L.kind(flow.actions[state.action]) === 'program';
-  if (prog || !fresh(state, state.inFlight)) ctxOut(C, L.renderNext(flow, state));
+  if (!live(flow, state)) return;
+  if (!fresh(state, state.inFlight)) ctxOut(C, L.renderNext(flow, state));
 }
 function permissionRequest(C) {   // 선택 기능: 하네스 CLI 호출의 승인 프롬프트 생략 (config.auto_approve_cli)
   if (C.tool === 'exec' && L.harnessCmd(C.root, C.input.command) && L.config(C.root).auto_approve_cli) C.R.o.decision = 'approve';
@@ -390,7 +395,7 @@ function failClosed(C, e) {
 function optIn(ev) {
   if (ev.hook_event_name !== 'UserPromptSubmit') return false;
   const r = L.readJson(path.join(L.PLUGIN_DIR, 'router.json'), null);
-  const prompt = String(ev.prompt || '').trim();
+  const prompt = String(ev.prompt || ev.user_prompt || '').trim();
   return !!(r && Array.isArray(r.routes) && r.routes.some((x) => { try { return new RegExp(x.when, 'i').test(prompt); } catch { return false; } }));
 }
 function handle(ev, env = process.env) {
@@ -398,11 +403,9 @@ function handle(ev, env = process.env) {
   const root = L.findRoot(env.DEVIN_PROJECT_DIR || env.CLAUDE_PROJECT_DIR || ev.cwd);
   if (!fs.existsSync(path.join(root, L.DIR)) && !optIn(ev)) return R;   // 이 프로젝트는 하네스를 쓰지 않는다
   const C = { ev, env, root, R, tool: L.normTool(ev.tool_name || ''), input: ev.tool_input || {}, devin: !!(env.DEVIN_PROJECT_DIR || env.DEVIN_PLUGIN_ROOT),
-    src: env.STEP_HARNESS_HOOK ? 'project' : 'plugin', worker: env.STEP_HARNESS_WORKER || null };   // 어느 설치본이 부른 hook 인가 (중복 설치 판별용)
+    src: env.STEP_HARNESS_HOOK ? `hook:${env.STEP_HARNESS_HOOK}` : 'plugin' };   // 어느 등록이 부른 hook 인가 (같은 이벤트가 두 등록에서 두 번 오는 경우의 판별용)
   try {
     probe(C);
-    // 작업자의 Stop·프롬프트·결과는 흐름에 끼어들지 않는다 (판정은 프로그램이 한다. 끝난 실행의 작업자도 마찬가지)
-    if (C.worker && ev.hook_event_name !== 'PreToolUse' && ev.hook_event_name !== 'PermissionRequest') return R;
     switch (ev.hook_event_name) {
       case 'PreToolUse': L.withLock(root, () => preToolUse(C)); announce(C); break;
       case 'PostToolUse': postToolUse(C); announce(C); break;
@@ -413,8 +416,6 @@ function handle(ev, env = process.env) {
       default: break;
     }
   } catch (e) { failClosed(C, e); }
-  // 흐름이 사람에게 넘어갔거나 멈췄는데 프로그램이 아직 돌고 있으면 정리 (여기서 난 오류가 위의 판정을 바꾸지 않게 따로 감싼다)
-  if (!C.worker) { try { J.reapExec(root); } catch { /* 다음 이벤트에서 다시 시도 */ } }
   return R;
 }
 

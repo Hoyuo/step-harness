@@ -2,20 +2,13 @@
   "routes": [
     {
       "name": "code complete",
-      "when": "코드\\s*컴플리트\\s*(돌려|실행|해줘)|^/?cc\\b",
-      "flow": "flows/code-complete.flow.yaml",
-      "args": { "gate": "node scripts/validate-gate.mjs" }
-    },
-    {
-      "name": "delegate fix",
-      "when": "^fix:\\s*(\\S+)",
-      "flow": "flows/delegate.flow.yaml",
-      "args": { "target": "$1", "verify": "flutter analyze lib" }
-    },
-    {
-      "name": "code complete (program mode)",
-      "when": "^/?ccp\\b",
+      "when": "^/?cc\\b",
       "program": { "task": "코드 컴플리트 게이트를 통과시킨다", "done_when": ["code-complete"] }
+    },
+    {
+      "name": "fix with tests",
+      "when": "^fix:\\s*(.+)",
+      "program": { "task": "$1 을(를) 고치고 테스트를 통과시킨다", "done_when": ["unit-test"] }
     }
   ]
 }

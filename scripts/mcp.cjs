@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 'use strict';
-// step-harness MCP 서버 (stdio, 의존성 없음) — Code Mode 형태: 도구는 search / execute (+ 실행이 길 때 이어서 기다리는 check).
+// step-harness MCP 서버 (stdio, 의존성 없음) — Code Mode 형태: 도구는 plan / search / execute (+ 한 걸음이 끝났음을 알리는 check).
 // 각 도구는 harness.cjs CLI 를 그대로 부른다. 검증·실행·상태는 전부 CLI 쪽에 있다.
 //   등록 예 (Devin/Claude 의 MCP 설정):  { "step-harness": { "command": "node", "args": ["<plugin>/scripts/mcp.cjs"] } }
 const { spawnSync } = require('child_process');
@@ -9,11 +9,14 @@ const path = require('path');
 const L = require('./lib.cjs');
 
 const TOOLS = [
-  { name: 'search', description: 'Show the typed harness API (TypeScript declaration) and the registered gates, skills and agents. Optional query filters them.',
+  { name: 'plan', description: 'Start the plan step for the current task and print the plan API, the grammar and how to submit. Use this before changing anything in a plan-first project.',
+    inputSchema: { type: 'object', properties: {} } },
+  { name: 'search', description: 'Show the plan API (TypeScript declaration) and what is registered (checks, skills, subagents). Optional query filters them.',
     inputSchema: { type: 'object', properties: { query: { type: 'string', description: 'filter by name or description' } } } },
-  { name: 'execute', description: 'Verify and run ONE harness program: an `async (h) => { … }` TypeScript-subset function against the API from search. Rejected programs are not run; the errors say what to fix.',
+  { name: 'execute', description: 'Submit ONE plan: an `async (h) => { … }` TypeScript-subset program against the API from search. A rejected program starts nothing; the errors say what to fix. ' +
+      'An accepted program is carried out one step at a time: the reply contains your next step.',
     inputSchema: { type: 'object', properties: { code: { type: 'string', description: 'async (h) => { … }' } }, required: ['code'] } },
-  { name: 'check', description: 'Wait for the running program and print each step and the result. Call again while it prints STILL RUNNING.',
+  { name: 'check', description: 'Tell the harness that the current step is finished (or wait for a running check). Prints the verdict and the next step. Call again while it prints STILL RUNNING.',
     inputSchema: { type: 'object', properties: {} } },
 ];
 
@@ -48,6 +51,7 @@ function cli(args, input) {
   return { text: ((r.stdout || '') + (r.stderr || '')).trim() || '(no output)', isError: r.status !== 0 };
 }
 function call(name, a = {}) {
+  if (name === 'plan') return cli(['plan']);
   if (name === 'search') return cli(['search', ...(a.query ? [String(a.query)] : [])]);
   if (name === 'execute') return cli(['execute'], String(a.code || ''));   // 프로그램은 stdin 으로 (따옴표 문제 없음)
   if (name === 'check') return cli(['check', '--wait', '50']);
